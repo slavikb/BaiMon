@@ -16,7 +16,16 @@ extern "C" {
 #include <FS.h>
 
 /////////////////////////////////////////////////////////////
-// Settings
+// Defines
+
+enum // EBus addresses
+{
+  EBUS_ADDR_HOST   = 0,
+  EBUS_ADDR_BOILER = 8,  // Slave address for boiler (master address is 3)
+};
+
+/////////////////////////////////////////////////////////////
+// Settings (read from settings.json)
 
 struct Settings
 {
@@ -122,9 +131,10 @@ enum // special receive statuses
 
 enum
 {
-  // Max number of retries for failed command
+  // Max number of retries for failed command (bus collision or other error)
   CMD_MAX_RETRIES = 2,
   // Number of skipped SYN before retries
+  // (randomly selected between MIN_SYNC_SKIP and MAX_SYN_SKIP)
   CMD_MIN_SYNC_SKIP = 1,
   CMD_MAX_SYNC_SKIP = 5
 };
@@ -132,9 +142,10 @@ enum
 // 4K serial traffic buffer
 #define SERIAL_BUFFER_SIZE 0x1000
 
+// EBus data is stored in ring buffer (for diagnostics)
 uint8 g_serialBuffer[SERIAL_BUFFER_SIZE];
-// total serial buffer count (if overflows, reset to 0x80000000)
-uint32_t g_serialByteCount = 0;
+// Total byte count (if overflows, reset to 0x80000000)
+uint32 g_serialByteCount = 0;
 
 #define GET_SERIAL_BYTE_NO(NO) (g_serialBuffer[(NO) % SERIAL_BUFFER_SIZE])
 #define PUT_SERIAL_BYTE(B) do { \
@@ -143,16 +154,12 @@ uint32_t g_serialByteCount = 0;
     g_serialByteCount = 0x80000000; \
 } while(0)
 
+// Total receive error counter
 uint32 g_recvErrCnt = 0;
 
+// Sync sense
 volatile uint32 g_lastSyncTime = 0;  // last CLEAN sync time (with no data after)
 volatile uint32 g_nonSyncData = 0;   // flag: non-sync data was received
-
-enum
-{
-  EBUS_ADDR_HOST   = 0,
-  EBUS_ADDR_BOILER = 8,
-};
 
 #define INVALID_STATE_VALUE     0xFF
 #define INVALID_TEMPERATURE_VALUE  ((short)0x8000)
@@ -227,7 +234,7 @@ struct EBusCommand
     return m_state == CmdSuccess;
   }
 
-  // Init GetParm command (BD
+  // Prepare GetParm command (B5 09 03 0D ADDR_LO ADDR_HI)
   void PrepGetParm(unsigned int addrFrom, unsigned int addrTo, unsigned int parmNo, unsigned int respLen)
   {
     Clear();
@@ -291,7 +298,7 @@ bool ICACHE_RAM_ATTR RetryOrFail(volatile EBusCommand *cmd)
     g_activeCommand = cmd->m_next_cmd;
     return false;
   }
-  // restart command
+  // restart command at random interval
   uint32 r = RANDOM_REG32;
   
   cmd->m_state = EBusCommand::CmdInit;
@@ -302,6 +309,7 @@ bool ICACHE_RAM_ATTR RetryOrFail(volatile EBusCommand *cmd)
   return true;
 }
 
+// Send byte to EBus
 void ICACHE_RAM_ATTR SendChar(uint8 ch)
 {
   WRITE_PERI_REG(UART_FIFO(UART_EBUS), ch);
@@ -590,9 +598,9 @@ enum
   COMMAND_TIMEOUT  = 1000,  // command timeout (time to wait before declaring command failed)
   SYNC_TIMEOUT     = 2000,  // sync timeout (time to wait before entering NO_SYNC state)
 
-  FIRST_POLL_DELAY =     5*1000,
-  NORM_POLL_PERIOD = 10*60*1000,
-  FAIL_POLL_PERIOD =  1*60*1000,
+  FIRST_POLL_DELAY =     5*1000,  // Start polling EBus 5 seconds after startup
+  NORM_POLL_PERIOD = 10*60*1000,  // Poll EBus each 10 minutes if last command succeeded
+  FAIL_POLL_PERIOD =  1*60*1000,  // Poll EBus each 1 minute if last command failed
 
 // for debugging
 //  NORM_POLL_PERIOD = 15*1000,
@@ -936,10 +944,6 @@ void webResponseEnd(String& resp)
   resp.concat("</body></html>");
 }
 
-EBusCommand g_cmdGetState;
-EBusCommand g_cmdGetTemp;
-EBusCommand g_cmdGetPress;
-
 void webHandleRoot()
 {
   uint32 t = millis();
@@ -1006,43 +1010,9 @@ void webHandleRoot()
   g_webServer.send(200, "text/html", resp);
 }
 
-/*
-struct ProcAddr
-{
-  const char *name;
-  void * addr;
-};
-
-void setup();
-void loop();
-
-ProcAddr g_procAddrs[] = {
-  { "uart_int_handler", (void *)&uart_int_handler },
-  { "millis", (void *)&millis },
-//  { "random", (void *)&random },
-  { "ProcessReceive", (void *)&ProcessReceive },
-  { "RetryOrFail", (void *)&RetryOrFail },
-  { "Crc8Byte", (void *)&Crc8Byte },
-  { "ProcessMonitor", (void *)&ProcessMonitor },
-  { "SetLed", (void *)&SetLed },
-  { "webResponseBegin", (void *)&webResponseBegin },
-  { "setup", (void *)&setup },
-  { "loop", (void *)&loop },
-};
-*/
 
 void webHandleDiag()
 {
-//  ResetActiveCommand();
-  g_cmdGetState.PrepGetState(EBUS_ADDR_HOST, EBUS_ADDR_BOILER);
-  g_cmdGetTemp.PrepGetTemperature(EBUS_ADDR_HOST, EBUS_ADDR_BOILER);
-  g_cmdGetPress.PrepGetPressure(EBUS_ADDR_HOST, EBUS_ADDR_BOILER);
-  g_cmdGetState.m_next_cmd = &g_cmdGetTemp;
-  g_cmdGetTemp.m_next_cmd = &g_cmdGetPress;
-//  SetActiveCommand(&g_cmdGetState);
-
-//  delay(500);
-
   uint32 byteCount = g_serialByteCount;
   uint32 byteStart = (byteCount < 0x400) ? 0 : ((byteCount - 0x400) & ~(0x20-1));
 
@@ -1065,21 +1035,6 @@ void webHandleDiag()
   resp.concat(" errors: ");
   resp.concat(g_recvErrCnt);
 
-//  resp.concat(" cmd_state: ");
-//  resp.concat((unsigned int)g_cmdGetState.m_state);
-
-//  resp.concat(" State: ");
-//  resp.concat(g_cmdGetState.GetStateValue());
-
-//  resp.concat(";");
-
-//  for (uint32 i = 0; i < sizeof(g_procAddrs)/sizeof(g_procAddrs[0]); ++i)
-//  {
-//    char sbuf[40];
-//    sprintf(sbuf, "<br>%s = %p", g_procAddrs[i].name, g_procAddrs[i].addr);
-//    resp.concat(sbuf);
-//  }
-  
   resp.concat("<br>last data:<hr><div style=\"font-family: monospace;\">");
   while (byteStart < byteCount)
   {
@@ -1136,12 +1091,12 @@ void ProcessWebServer()
 }
 
 /////////////////////////////////////////////////////////////
-// Narodmon
+// Sending data to narodmon.ru
 
 enum
 {
-  NarodMonMinDelay = 7*60*1000,
-  NarodMonInterval = 30*60*1000
+  NarodMonMinDelay = 7*60*1000,  // Start sending data 7 minutes after restart
+  NarodMonInterval = 30*60*1000  // Send data each 30 minutes
 };
 
 void ProcessNarodmon()
