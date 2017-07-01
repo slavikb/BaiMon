@@ -1,4 +1,4 @@
-// BaiMon
+// BaiMon 
 //
 //
 
@@ -17,6 +17,8 @@ extern "C" {
 
 /////////////////////////////////////////////////////////////
 // Defines
+
+#define BAIMON_VERSION "1.1"
 
 enum // EBus addresses
 {
@@ -620,6 +622,8 @@ uint32 g_monCmdActive = false;   // command active, wait MAX_CMD_DELAY after g_l
 uint32 g_syncOk = false;         // synchronization is OK
 uint32 g_lastCmdSucceed = false; // last command succeeded
 
+uint32 g_requestData = false;    // Flag: request data immediately
+
 EBusCommand g_monGetState;
 EBusCommand g_monGetTemp;
 EBusCommand g_monGetPress;
@@ -729,12 +733,16 @@ void ProcessMonitor()
     }
   }
 
+  if (g_requestData)
+    needRequest = true;
+
   if (needRequest)
   {
     if (g_activeCommand == 0)
     {
       g_lastMonitorTime = t;
       g_monCmdActive = true;
+      g_requestData = false;
 
       g_monGetState.PrepGetState(EBUS_ADDR_HOST, EBUS_ADDR_BOILER);
       g_monGetTemp.PrepGetTemperature(EBUS_ADDR_HOST, EBUS_ADDR_BOILER);
@@ -753,15 +761,18 @@ uint32 g_ledState = 0; // bit mask
 
 enum
 {
-  GreenLed = 12,    // Wemos D1R2: D12/MISO
-  YellowLed = 13,   // Wemos D1R2: D11/MOSI
-  RedLed = 14       // Wemos D1R2: D13/SCK
+  // Green LED [Power/WiFi]: On - connected, Blink - trying to connect
+  GreenLed = 12,    // Wemos Mini: D6/MISO; Wemos D1: D12/MISO
+  // Yellow LED [EBus sync]: On - EBus sync bytes (0xAA) detected, Off - not detected or mixed with garbage
+  YellowLed = 13,   // Wemos Mini: D7/MOSI; Wemos D1: D11/MOSI
+  // Red LED [Request/Error]: On - last request failed, Off - last request OK, Blink - request is being sent
+  RedLed = 14       // Wemos Mini: D5/SCK;  Wemos D1: D13/SCK
 };
 
 enum
 {
-  WIFI_BLINK_PERIOD = 100,
-  COMMAND_BLINK_PERIOD = 50,  // during command processing
+  WIFI_BLINK_PERIOD = 100,    // Green LED - when trying to connect WiFi
+  COMMAND_BLINK_PERIOD = 50,  // Red LED - during command processing
 };
 
 bool GetLed(int no)
@@ -923,7 +934,7 @@ bool webFileRead(const String& uri)
   return true;
 }
 
-void webResponseBegin(String& resp, const char *title, int refresh)
+void webResponseBegin(String& resp, int refresh)
 {
   resp.concat("<html><head>");
   if (refresh != 0)
@@ -932,9 +943,8 @@ void webResponseBegin(String& resp, const char *title, int refresh)
       resp.concat(refresh);
       resp.concat("\'/>");
   }
-  resp.concat("<title>");
-  resp.concat(title);
-  resp.concat("</title><style>"
+  resp.concat("<title>BaiMon v " BAIMON_VERSION "</title>"
+    "<style>"
       "body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }"
     "</style></head><body>");
 }
@@ -953,7 +963,7 @@ void webHandleRoot()
   uint32 hr = min / 60;  
 
   String resp;
-  webResponseBegin(resp, "Boiler status", 10);
+  webResponseBegin(resp, 10);
 
   resp.concat("<h1>Boiler status</h1>");
 
@@ -964,6 +974,10 @@ void webHandleRoot()
 
   resp.concat("<p>EBus sync: ");
   resp.concat(g_syncOk ? "<span style=\"color:green;\">OK</span>" : "<span style=\"color:red;\">FAIL</span>");
+
+  resp.concat("<form action=\"/request-data\" method=\"POST\" enctype=\"application/x-www-form-urlencoded\">");
+  resp.concat("<button type=\"submit\">Request data</button>");
+  resp.concat("</form>");
 
   resp.concat("<hr>Measurement history:<br><table border=\"0\"><tr><th>Time</th><th>State</th><th>Temperature,C</th><th>Pressure,Bar</th><th>Retries</th></tr>");
   for (uint32 i = 0, cnt = g_parmHistorySize > 20 ? 20 : g_parmHistorySize; i != cnt; ++i)
@@ -1010,6 +1024,18 @@ void webHandleRoot()
   g_webServer.send(200, "text/html", resp);
 }
 
+void webHandleRequestData()
+{
+  g_requestData = true;
+  
+  String resp;
+  webResponseBegin(resp, 0);
+  resp.concat("<h1>Requesting data</h1>");
+  webResponseEnd(resp);
+
+  g_webServer.sendHeader("Location", "/", false);
+  g_webServer.send(302, "text/html", resp);
+}
 
 void webHandleDiag()
 {
@@ -1017,17 +1043,13 @@ void webHandleDiag()
   uint32 byteStart = (byteCount < 0x400) ? 0 : ((byteCount - 0x400) & ~(0x20-1));
 
   String resp;
-  webResponseBegin(resp, "Diagnostics", 0);
+  webResponseBegin(resp, 0);
 
   char tbuf[40];
 
   resp.concat("<h1>Diagnostics</h1>");
   resp.concat("MAC: ");
   resp.concat(WiFi.macAddress());
-  resp.concat(" NarodMonTime:  ");
-  resp.concat(g_lastNarodMonTime);
-  resp.concat(" NarodMonTry:  ");
-  resp.concat(g_narodMonTry);
   resp.concat("<br>Total bytes received: ");
   sprintf(tbuf, "0x%08X", byteCount);
   resp.concat(tbuf);
@@ -1080,6 +1102,7 @@ void webHandleNotFound()
 void SetupWebServer()
 {
   g_webServer.on("/", webHandleRoot);
+  g_webServer.on("/request-data", webHandleRequestData);
   g_webServer.on("/diag", webHandleDiag);
   g_webServer.onNotFound(webHandleNotFound);
   g_webServer.begin();
