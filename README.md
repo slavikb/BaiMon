@@ -15,4 +15,3 @@ Controller comminicates to the boiler using UART. Adapter is needed to adjust si
 
 EBus-adapter.pdf contains schematics of a simple EBus adapter with optical decoupling. It can be connected directly to ESP8266 outputs. 
 
-This adapter has 3 status LEDs: green indicates power status, yellow - data receive, red - data transmit.
