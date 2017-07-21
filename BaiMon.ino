@@ -18,13 +18,36 @@ extern "C" {
 /////////////////////////////////////////////////////////////
 // Defines
 
-#define BAIMON_VERSION "1.1"
+#define BAIMON_VERSION "1.2"
 
 enum // EBus addresses
 {
   EBUS_ADDR_HOST   = 0,
   EBUS_ADDR_BOILER = 8,  // Slave address for boiler (master address is 3)
 };
+
+/////////////////////////////////////////////////////////////
+// History byffer sizes
+
+// EBus data history buffer size
+#define SERIAL_BUFFER_SIZE 0x1000
+// Measurement parameter history size
+#define MAX_PARM_HISTORY 64
+
+// Web page parameters
+// Show parameter measurements on page (<=MAX_PARM_HISTORY)
+#define WEB_PARM_HISTORY 25
+// Size of traffic data shown on diagnostics page (<=SERIAL_BUFFER_SIZE)
+#define WEB_DIAG_DATA_SIZE 0x400
+
+// Failed commands history size
+#define FAILED_COMMAND_HISTORY_SIZE 4
+// Max number of bytes to collect for failed command
+#define FAILED_COMMAND_BYTES_MAX   128
+// Number of bytes before command to display (<FAILED_COMMAND_BYTES_MAX)
+#define FAILED_COMMAND_BYTES_BEFORE 16
+// Time window to collect data for failed command history (ms)
+#define FAILED_COMMAND_TIME_WINDOW 8000
 
 /////////////////////////////////////////////////////////////
 // Settings (read from settings.json)
@@ -140,9 +163,6 @@ enum
   CMD_MIN_SYNC_SKIP = 1,
   CMD_MAX_SYNC_SKIP = 5
 };
-
-// 4K serial traffic buffer
-#define SERIAL_BUFFER_SIZE 0x1000
 
 // EBus data is stored in ring buffer (for diagnostics)
 uint8 g_serialBuffer[SERIAL_BUFFER_SIZE];
@@ -574,9 +594,8 @@ struct ParmHistData
   unsigned short m_pressure;
   uint8  m_state;
   uint8  m_retries;
+  uint16 m_savedBytes;   // saved byte count (for last failed commands)
 };
-
-#define MAX_PARM_HISTORY 256
 
 //
 // Indication state transition table:
@@ -612,6 +631,64 @@ enum
 ParmHistData g_parmHistory[MAX_PARM_HISTORY];
 uint32 g_parmHistorySize = 0; // total size (must % MAX_PARM_HISTORY to get index)
 
+ParmHistData g_lastFailedCommands[FAILED_COMMAND_HISTORY_SIZE];
+uint32 g_failedCommandCount = 0; // number of last failed commands (must % FAILED_COMMAND_HISTORY_SIZE to get index)
+
+// failed command buffer
+uint8  g_failedCommandBytes[FAILED_COMMAND_BYTES_MAX * FAILED_COMMAND_HISTORY_SIZE];
+
+// Appends received data to last failed command data buffer (up to FAILED_COMMAND_BYTES_MAX)
+void SaveLastFailedCommandBytes()
+{
+  if (g_failedCommandCount == 0)
+    return;
+
+  uint32 cmdIdx = (g_failedCommandCount-1) % FAILED_COMMAND_HISTORY_SIZE;
+  ParmHistData& cmd = g_lastFailedCommands[cmdIdx];
+  if (cmd.m_savedBytes == FAILED_COMMAND_BYTES_MAX)
+    return; // data buffer already filled
+
+  if ((millis() - cmd.m_timeStamp) > FAILED_COMMAND_TIME_WINDOW)
+    return;
+
+  uint32 byteIndex = cmd.m_byteIndex;
+  if (byteIndex >= FAILED_COMMAND_BYTES_BEFORE)
+    byteIndex -= FAILED_COMMAND_BYTES_BEFORE;
+  else
+    byteIndex = 0;
+
+  uint32 currentByteCount = g_serialByteCount;
+  if (byteIndex > currentByteCount)
+    return;  // currentByteCount overflows, this case is not supported for simplicity
+  uint32 availBytes = currentByteCount - byteIndex;
+  if (availBytes > SERIAL_BUFFER_SIZE/2) // data too old, buffer may be overwritten
+    return;
+  if (availBytes > FAILED_COMMAND_BYTES_MAX)
+    availBytes = FAILED_COMMAND_BYTES_MAX;
+
+  uint8 *cmdBytes = g_failedCommandBytes + (cmdIdx * FAILED_COMMAND_BYTES_MAX);
+  while (cmd.m_savedBytes < availBytes)
+  {
+    cmdBytes[cmd.m_savedBytes] = g_serialBuffer[(byteIndex + cmd.m_savedBytes) % SERIAL_BUFFER_SIZE];
+    cmd.m_savedBytes++;
+  }
+}
+
+void SaveLastFailedCommand()
+{
+  if (g_parmHistorySize == 0)
+    return;
+
+  uint32 cmdIdx = g_failedCommandCount % FAILED_COMMAND_HISTORY_SIZE;
+  // save last command to failed command list
+  const ParmHistData& lastParmData = g_parmHistory[(g_parmHistorySize - 1) % MAX_PARM_HISTORY];
+  g_lastFailedCommands[cmdIdx] = lastParmData;
+  g_lastFailedCommands[cmdIdx].m_savedBytes = 0;
+  g_failedCommandCount++;
+
+  SaveLastFailedCommandBytes();
+}
+
 uint32 g_monitorState = STATE_NO_SYNC;
 
 uint32 g_lastMonitorTime = 0;
@@ -624,6 +701,7 @@ uint32 g_lastCmdSucceed = false; // last command succeeded
 
 uint32 g_requestData = false;    // Flag: request data immediately
 
+// EBus commands processed by interrupt handler
 EBusCommand g_monGetState;
 EBusCommand g_monGetTemp;
 EBusCommand g_monGetPress;
@@ -682,11 +760,12 @@ void ProcessMonitor()
 
       ParmHistData& parmData = g_parmHistory[g_parmHistorySize % MAX_PARM_HISTORY];
       parmData.m_timeStamp = g_lastMonitorTime;
-      parmData.m_byteIndex = g_monGetTemp.m_byteIndex;
+      parmData.m_byteIndex = g_monGetState.m_byteIndex;  // should use first command in chain
       parmData.m_temperature = g_monGetTemp.GetTemperatureValue();
       parmData.m_pressure = g_monGetPress.GetPressureValue();
       parmData.m_state = g_monGetState.GetStateValue();
       parmData.m_retries = g_monGetState.m_retryCount + g_monGetTemp.m_retryCount + g_monGetPress.m_retryCount;
+      parmData.m_savedBytes = 0;
       g_parmHistorySize++;
 
       if (parmData.m_temperature != INVALID_TEMPERATURE_VALUE && parmData.m_pressure != INVALID_PRESSURE_VALUE)
@@ -709,7 +788,9 @@ void ProcessMonitor()
       else
       {
         g_monitorState = g_syncOk ? STATE_CMD_FAIL : STATE_NO_SYNC;
+        SaveLastFailedCommand();
       }
+
     }
   }
   else
@@ -744,14 +825,18 @@ void ProcessMonitor()
       g_monCmdActive = true;
       g_requestData = false;
 
+      // Build EBus command chain
       g_monGetState.PrepGetState(EBUS_ADDR_HOST, EBUS_ADDR_BOILER);
       g_monGetTemp.PrepGetTemperature(EBUS_ADDR_HOST, EBUS_ADDR_BOILER);
       g_monGetPress.PrepGetPressure(EBUS_ADDR_HOST, EBUS_ADDR_BOILER);
       g_monGetState.m_next_cmd = &g_monGetTemp;
       g_monGetTemp.m_next_cmd = &g_monGetPress;
+      // Enable command processing by interrupt handler
       g_activeCommand = &g_monGetState;
     }
   }
+
+  SaveLastFailedCommandBytes();
 }
 
 /////////////////////////////////////////////////////////////
@@ -771,8 +856,8 @@ enum
 
 enum
 {
-  WIFI_BLINK_PERIOD = 100,    // Green LED - when trying to connect WiFi
-  COMMAND_BLINK_PERIOD = 50,  // Red LED - during command processing
+  WIFI_BLINK_PERIOD = 100,    // Green LED - blink when trying to connect WiFi
+  COMMAND_BLINK_PERIOD = 50,  // Red LED - blink during EBus command processing
 };
 
 bool GetLed(int no)
@@ -839,6 +924,7 @@ void SetupIndication()
   pinMode(GreenLed, OUTPUT);
   pinMode(YellowLed, OUTPUT);
   pinMode(RedLed, OUTPUT);
+  // Blink all LEDs 3 times on startup (indication test)
   for (int i = 0; i < 3; ++i)
   {
     if (i != 0)
@@ -980,7 +1066,7 @@ void webHandleRoot()
   resp.concat("</form>");
 
   resp.concat("<hr>Measurement history:<br><table border=\"0\"><tr><th>Time</th><th>State</th><th>Temperature,C</th><th>Pressure,Bar</th><th>Retries</th></tr>");
-  for (uint32 i = 0, cnt = g_parmHistorySize > 20 ? 20 : g_parmHistorySize; i != cnt; ++i)
+  for (uint32 i = 0, cnt = (g_parmHistorySize > WEB_PARM_HISTORY) ? WEB_PARM_HISTORY : g_parmHistorySize; i != cnt; ++i)
   {
     const ParmHistData& parmData = g_parmHistory[(g_parmHistorySize - i - 1) % MAX_PARM_HISTORY];
 
@@ -1040,7 +1126,9 @@ void webHandleRequestData()
 void webHandleDiag()
 {
   uint32 byteCount = g_serialByteCount;
-  uint32 byteStart = (byteCount < 0x400) ? 0 : ((byteCount - 0x400) & ~(0x20-1));
+  uint32 byteStart = (byteCount < WEB_DIAG_DATA_SIZE) ? 0 : ((byteCount - WEB_DIAG_DATA_SIZE) & ~(0x20-1));
+
+  uint32 t = millis();
 
   String resp;
   webResponseBegin(resp, 0);
@@ -1057,7 +1145,7 @@ void webHandleDiag()
   resp.concat(" errors: ");
   resp.concat(g_recvErrCnt);
 
-  resp.concat("<br>last data:<hr><div style=\"font-family: monospace;\">");
+  resp.concat("<hr>Last EBus data:<div style=\"font-family: monospace;\">");
   while (byteStart < byteCount)
   {
     uint32 portion = byteCount - byteStart;
@@ -1074,6 +1162,46 @@ void webHandleDiag()
     byteStart += portion;
     resp.concat("<br>");
   }
+  resp.concat("</div><hr><div>Failed command history:<br>");
+  uint32 failedCmdCnt = FAILED_COMMAND_HISTORY_SIZE;
+  if (g_failedCommandCount < failedCmdCnt)
+    failedCmdCnt = g_failedCommandCount;
+
+  for (uint32 n = 0; n < failedCmdCnt; ++n)
+  {
+    uint32 cmdIdx = (g_failedCommandCount - n - 1) % FAILED_COMMAND_HISTORY_SIZE;
+    const ParmHistData& cmd = g_lastFailedCommands[cmdIdx];
+    const uint8 *cmdBytes = g_failedCommandBytes + cmdIdx * FAILED_COMMAND_BYTES_MAX;
+
+    uint32 dt = t - cmd.m_timeStamp;
+    uint32 dtsec = dt / 1000;
+    uint32 dtmin = dtsec / 60;
+    uint32 dthr = dtmin / 60;  
+
+    char buf[200];
+    sprintf(buf, "<div>#%u: -%02u:%02u:%02u [%u bytes] [pre: %u]</div>", n+1, dthr, dtmin % 60, dtsec % 60, cmd.m_savedBytes, FAILED_COMMAND_BYTES_BEFORE);
+    resp.concat(buf);
+    resp.concat("<div style=\"font-family: monospace;\">");
+    uint32 bc = 0;
+    while (bc < cmd.m_savedBytes)
+    {
+      uint32 portion = cmd.m_savedBytes - bc;
+      if (portion > 32)
+        portion = 32;
+      sprintf(tbuf, "%08X:", bc);
+      resp.concat(tbuf);
+      for (uint32 i = 0; i < portion; ++i)
+      {
+        uint8 ch = cmdBytes[bc + i];
+        sprintf(tbuf, "%s%02X", ((i & 0x0F) == 0 ? "&nbsp;&nbsp;" : "&nbsp;"),  ch);
+        resp.concat(tbuf);
+      }
+      bc += portion;
+      resp.concat("<br>");
+    }
+    resp.concat("</div>");
+  }
+
   resp.concat("</div><hr><a href=\"/\">[Main]</a>");
 
   webResponseEnd(resp);
