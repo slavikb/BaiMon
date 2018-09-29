@@ -1,0 +1,34 @@
+// Copy this file to local_config.h and edit appropriately
+//
+
+// WiFi settings
+#define CONFIG_WIFI_SSID "mywifi"
+#define CONFIG_WIFI_PASS "mywifipassword"
+
+// Operational settings
+
+// EBus device address for BaiMon (master)
+#define CONFIG_EBUS_ADDR_HOST   0
+// EBus device address for boiler (master)
+#define CONFIG_EBUS_ADDR_BOILER 3
+
+// EBus device poll intervals (seconds)
+
+// EBus poll interval when last command succeeded
+#define CONFIG_POLL_INTERVAL_NORM 600
+// EBus poll interval whan last command failed
+#define CONFIG_POLL_INTERVAL_FAIL 60
+// Delay before first poll after detecting EBus presense
+#define CONFIG_FIRST_POLL_DELAY 5
+
+// Narodmon.ru settings
+
+// Enable data upload to narodmon.ru
+#define CONFIG_NARODMON_ENABLE 0
+// Narodmon device ID (device MAC address)
+#define CONFIG_NARODMON_DEVICE_ID "00:00:00:00:00:00"
+// Send interval (seconds)
+#define CONFIG_NARODMON_SEND_INTERVAL 600
+// Startup delay (seconds) to avoid violating narodmon max data rate
+#define CONFIG_NARODMON_START_DELAY 400
+

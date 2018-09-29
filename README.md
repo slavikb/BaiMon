@@ -4,8 +4,9 @@ ESP8266 - based monitoring device for Vaillant boilers.
 
 Periodically monitors boiler internal state, temperature and pressure.
 
-Measured values can be viewed using Web interface.
-Automatic data publishing to 'narodmon.ru' is also available.
+Publishes measured results to 'narodmon.ru'
+
+Has its own web interface for viewing measured data and debugging EBus activity.
 
 This version supports Vaillant TurboTec Pro, but can be easily adapted to other models having EBus interface.
 

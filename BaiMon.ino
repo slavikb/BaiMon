@@ -1,4 +1,4 @@
-// BaiMon 
+// BaiMon - Vaillant TurboTec family boiler monitor
 //
 //
 
@@ -12,18 +12,20 @@ extern "C" {
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <WiFiClient.h>
-#include <ArduinoJson.h>
-#include <FS.h>
+
+#include "local_config.h"
 
 /////////////////////////////////////////////////////////////
 // Defines
 
-#define BAIMON_VERSION "1.2"
+#define BAIMON_VERSION "1.3"
+
+#define EBUS_SLAVE_ADDR(MASTER) ((MASTER)+5)
 
 enum // EBus addresses
 {
-  EBUS_ADDR_HOST   = 0,
-  EBUS_ADDR_BOILER = 8,  // Slave address for boiler (master address is 3)
+  EBUS_ADDR_HOST   = CONFIG_EBUS_ADDR_HOST,
+  EBUS_ADDR_BOILER = EBUS_SLAVE_ADDR(CONFIG_EBUS_ADDR_BOILER),
 };
 
 /////////////////////////////////////////////////////////////
@@ -50,68 +52,12 @@ enum // EBus addresses
 #define FAILED_COMMAND_TIME_WINDOW 8000
 
 /////////////////////////////////////////////////////////////
-// Settings (read from settings.json)
-
-struct Settings
-{
-  char m_ssid[32];
-  char m_password[64];  
-
-  void clear()
-  {
-    m_ssid[0] = 0;
-    m_password[0] = 0;
-  }
-};
-
-void GetJsonString(JsonObject& obj, const char *name, char *buf, size_t bsz)
-{
-  const char *val = obj.get<const char *>(name);
-  if (val == 0)
-  {
-    buf[0] = 0;
-  }
-  else
-  {
-    strncpy(buf, val, bsz);
-    buf[bsz-1] = 0;
-  }
-}
-
-bool LoadSettingsFromFile(const char *fname, Settings& settings)
-{
-  settings.clear();
-  
-  DynamicJsonBuffer wifiJsonBuffer(512);
-
-  File file = SPIFFS.open(fname, "r");
-  if (! file)
-    return false;
-
-  JsonObject& root = wifiJsonBuffer.parse(file);
-  if (root == JsonObject::invalid())
-    return false;
-
-  GetJsonString(root, "ssid", settings.m_ssid, sizeof(settings.m_ssid));
-  GetJsonString(root, "pass", settings.m_password, sizeof(settings.m_password));
-
-  return true;
-}
-
-Settings g_settings;
-
-bool LoadSettings()
-{
-  return LoadSettingsFromFile("/settings.json", g_settings);
-}
-
-/////////////////////////////////////////////////////////////
 // WiFi
 
 void SetupWifi()
 {
   WiFi.mode(WIFI_STA);
-  WiFi.begin(g_settings.m_ssid, g_settings.m_password);
+  WiFi.begin(CONFIG_WIFI_SSID, CONFIG_WIFI_PASS);
 }
 
 /////////////////////////////////////////////////////////////
@@ -619,13 +565,9 @@ enum
   COMMAND_TIMEOUT  = 1000,  // command timeout (time to wait before declaring command failed)
   SYNC_TIMEOUT     = 2000,  // sync timeout (time to wait before entering NO_SYNC state)
 
-  FIRST_POLL_DELAY =     5*1000,  // Start polling EBus 5 seconds after startup
-  NORM_POLL_PERIOD = 10*60*1000,  // Poll EBus each 10 minutes if last command succeeded
-  FAIL_POLL_PERIOD =  1*60*1000,  // Poll EBus each 1 minute if last command failed
-
-// for debugging
-//  NORM_POLL_PERIOD = 15*1000,
-//  FAIL_POLL_PERIOD =  7*1000,
+  FIRST_POLL_DELAY = CONFIG_FIRST_POLL_DELAY*1000,    // Delay before first EBus poll on startup
+  NORM_POLL_PERIOD = CONFIG_POLL_INTERVAL_NORM*1000,  // EBus poll interval when last command succeeded
+  FAIL_POLL_PERIOD = CONFIG_POLL_INTERVAL_FAIL*1000,  // EBus poll interval when last command failed 
 };
 
 ParmHistData g_parmHistory[MAX_PARM_HISTORY];
@@ -706,14 +648,14 @@ EBusCommand g_monGetState;
 EBusCommand g_monGetTemp;
 EBusCommand g_monGetPress;
 
-// for monitoring
+// Narodmon.ru data upload
 uint32 g_lastResultValid = false;
 uint32 g_lastResultSent = false;
+uint32 g_lastState = 0;
 uint32 g_lastTempValue = 0;
 uint32 g_lastPressValue = 0;
 
 uint32 g_lastNarodMonTime = 0;
-uint32 g_narodMonTry = 0;
 
 void SetupMonitor()
 {
@@ -768,11 +710,13 @@ void ProcessMonitor()
       parmData.m_savedBytes = 0;
       g_parmHistorySize++;
 
+      g_lastResultSent = false;
+      g_lastState = parmData.m_state;
+
       if (parmData.m_temperature != INVALID_TEMPERATURE_VALUE && parmData.m_pressure != INVALID_PRESSURE_VALUE)
       {
         g_lastTempValue = parmData.m_temperature;
         g_lastPressValue = parmData.m_pressure;
-        g_lastResultSent = false;
         g_lastResultValid = true;
       }
       else
@@ -790,7 +734,6 @@ void ProcessMonitor()
         g_monitorState = g_syncOk ? STATE_CMD_FAIL : STATE_NO_SYNC;
         SaveLastFailedCommand();
       }
-
     }
   }
   else
@@ -959,66 +902,9 @@ void ProcessIndication()
 }
 
 /////////////////////////////////////////////////////////////
-// Web server helpers
-
-struct ExtContentType
-{
-  const char * extension;
-  const char * content_type;
-};
-
-const ExtContentType g_extContentTypes[] =
-{
-  { ".htm",  "text/html" },
-  { ".html", "text/html" },
-  { ".css",  "text/css"  },
-  { ".js",   "application/javascript" },
-  { ".png",  "image/png" },
-  { ".gif",  "image/gif" },
-  { ".jpg",  "image/jpeg" },
-  { ".jpeg", "image/jpeg" },
-  { ".xml",  "text/xml" },
-  { ".pdf",  "application/x-pdf" },
-  { ".zip",  "application/x-zip" },
-  { ".gz",   "application/x-gzip" }
-};
-
-const char * GetContentTypeByPath(const String& filename)
-{
-  for (size_t i=0, cnt=sizeof(g_extContentTypes)/sizeof(g_extContentTypes[0]); i != cnt; ++i)
-  {
-    const ExtContentType& ct = g_extContentTypes[i];
-    if (filename.endsWith(ct.extension)) 
-      return ct.content_type;
-  }
-  return "text/plain";
-}
-
-/////////////////////////////////////////////////////////////
 // Web server
 
 ESP8266WebServer g_webServer(80);
-
-bool webFileRead(const String& uri)
-{
-  String path = "/www";
-  path += uri;
-
-  if(path.endsWith("/"))
-    return false;
- 
-  if(! SPIFFS.exists(path))
-    return false;
-
-  const char * contentType = GetContentTypeByPath(path);
-
-  File file = SPIFFS.open(path, "r");
-  if (! file)
-    return false;
-  g_webServer.streamFile(file, contentType);
-  file.close();
-  return true;
-}
 
 void webResponseBegin(String& resp, int refresh)
 {
@@ -1210,9 +1096,6 @@ void webHandleDiag()
 
 void webHandleNotFound()
 {
-  if (webFileRead(g_webServer.uri()))
-    return;
-  
   String message = "404 Not Found\n\n";
   message += "URI: ";
   message += g_webServer.uri();
@@ -1246,12 +1129,17 @@ void ProcessWebServer()
 
 enum
 {
-  NarodMonMinDelay = 7*60*1000,  // Start sending data 7 minutes after restart
-  NarodMonInterval = 30*60*1000  // Send data each 30 minutes
+  NarodMonMinDelay = CONFIG_NARODMON_START_DELAY*1000,   // Delay before first send after startup
+  NarodMonInterval = CONFIG_NARODMON_SEND_INTERVAL*1000  // Regular data sending interval
 };
 
 void ProcessNarodmon()
 {
+#if CONFIG_NARODMON_ENABLE
+
+  if (g_syncOk && g_lastResultSent)
+    return;
+
   uint32 t = millis();
 
   // first time interval
@@ -1266,26 +1154,36 @@ void ProcessNarodmon()
       return;
   }
 
-  if (! g_lastResultValid || g_lastResultSent)
-    return;
-
-  ++g_narodMonTry;
-
   WiFiClient sock;
   if (! sock.connect("narodmon.ru", 8283))
     return;
 
   char databuf[200];
-  sprintf(databuf, "#%s\n#T1#%d.%02u\n#P1#%d.%02u\n##\n",
-    WiFi.macAddress().c_str(), 
-    g_lastTempValue/16, (g_lastTempValue & 0xF)*100/16,
-    g_lastPressValue/1000, (g_lastPressValue % 1000)/10
-  );
+  if (g_syncOk && g_lastResultValid)
+  {
+    // send state, temperature and pressure
+    sprintf(databuf, "#%s\n#S1#%d\n#T1#%d.%02u\n#P1#%d.%02u\n##\n",
+      CONFIG_NARODMON_DEVICE_ID, g_lastState,
+      g_lastTempValue/16, (g_lastTempValue & 0xF)*100/16,
+      g_lastPressValue/1000, (g_lastPressValue % 1000)/10
+    );
+  }
+  else
+  {
+    // send only state (255 if EBus is not available)
+    const uint32 state = g_syncOk ? g_lastState : 255;
+    sprintf(databuf, "#%s\n#S1#%d\n##\n",
+      CONFIG_NARODMON_DEVICE_ID, state
+    );
+  }
 
   const size_t sz = strlen(databuf);
   sock.write((const uint8 *)databuf, sz);
 
+  g_lastResultSent = true;
   g_lastNarodMonTime = t;
+
+#endif // CONFIG_NARODMON_ENABLE
 }
 
 /////////////////////////////////////////////////////////////
@@ -1294,9 +1192,6 @@ void ProcessNarodmon()
 void setup()
 {
   Serial.begin(2400);
-  SPIFFS.begin();
-
-  LoadSettings();
 
   SetupIndication();
   SetupWifi();
@@ -1313,4 +1208,3 @@ void loop()
   ProcessWebServer();
   delay(10);
 }
-
