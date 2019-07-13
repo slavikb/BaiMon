@@ -21,14 +21,22 @@
 // Delay before first poll after detecting EBus presense
 #define CONFIG_FIRST_POLL_DELAY 5
 
-// Narodmon.ru settings
+// MQTT settings
 
-// Enable data upload to narodmon.ru
-#define CONFIG_NARODMON_ENABLE 0
-// Narodmon device ID (device MAC address)
-#define CONFIG_NARODMON_DEVICE_ID "00:00:00:00:00:00"
+// Enable data upload to MQTT server
+#define CONFIG_MQTT_ENABLE 1
+// MQTT server host name
+#define CONFIG_MQTT_HOST "narodmon.ru"
+// MQTT server port
+#define CONFIG_MQTT_PORT 1883
+// MQTT user name and password
+#define CONFIG_MQTT_USERNAME "my_login"
+#define CONFIG_MQTT_PASSWORD "my_password"
+// MQTT client ID (narodmon: device MAC address)
+#define CONFIG_MQTT_CLIENT_ID "00:00:00:00:00:00"
+// MQTT topic name (narodmon: user/devname)
+#define CONFIG_MQTT_TOPIC "user/device"
 // Send interval (seconds)
-#define CONFIG_NARODMON_SEND_INTERVAL 600
+#define CONFIG_MQTT_SEND_INTERVAL 600
 // Startup delay (seconds) to avoid violating narodmon max data rate
-#define CONFIG_NARODMON_START_DELAY 400
-
+#define CONFIG_MQTT_START_DELAY 400

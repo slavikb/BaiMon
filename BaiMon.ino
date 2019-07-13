@@ -12,13 +12,14 @@ extern "C" {
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <WiFiClient.h>
+#include <PubSubClient.h>
 
 #include "local_config.h"
 
 /////////////////////////////////////////////////////////////
 // Defines
 
-#define BAIMON_VERSION "1.3"
+#define BAIMON_VERSION "1.4"
 
 #define EBUS_SLAVE_ADDR(MASTER) ((MASTER)+5)
 
@@ -648,14 +649,14 @@ EBusCommand g_monGetState;
 EBusCommand g_monGetTemp;
 EBusCommand g_monGetPress;
 
-// Narodmon.ru data upload
+// MQTT data upload
 uint32 g_lastResultValid = false;
 uint32 g_lastResultSent = false;
 uint32 g_lastState = 0;
 uint32 g_lastTempValue = 0;
 uint32 g_lastPressValue = 0;
 
-uint32 g_lastNarodMonTime = 0;
+uint32 g_lastMqttSendTime = 0;
 
 void SetupMonitor()
 {
@@ -1125,17 +1126,18 @@ void ProcessWebServer()
 }
 
 /////////////////////////////////////////////////////////////
-// Sending data to narodmon.ru
+// Sending data to MQTT server
 
 enum
 {
-  NarodMonMinDelay = CONFIG_NARODMON_START_DELAY*1000,   // Delay before first send after startup
-  NarodMonInterval = CONFIG_NARODMON_SEND_INTERVAL*1000  // Regular data sending interval
+  MqttSendMinDelay = CONFIG_MQTT_START_DELAY*1000,   // Delay before first send after startup
+  MqttSendInterval = CONFIG_MQTT_SEND_INTERVAL*1000  // Regular data sending interval
 };
 
-void ProcessNarodmon()
+
+void ProcessMqttSend()
 {
-#if CONFIG_NARODMON_ENABLE
+#if CONFIG_MQTT_ENABLE
 
   if (g_syncOk && g_lastResultSent)
     return;
@@ -1143,47 +1145,48 @@ void ProcessNarodmon()
   uint32 t = millis();
 
   // first time interval
-  if (g_lastNarodMonTime == 0)
+  if (g_lastMqttSendTime == 0)
   {
-    if (t < NarodMonMinDelay)
+    if (t < MqttSendMinDelay)
       return;
   }
   else
   {
-    if ((t - g_lastNarodMonTime) < NarodMonInterval)
+    if ((t - g_lastMqttSendTime) < MqttSendInterval)
       return;
   }
 
-  WiFiClient sock;
-  if (! sock.connect("narodmon.ru", 8283))
+  g_lastMqttSendTime = t;
+
+  WiFiClient wifiClient;
+  PubSubClient mqttClient(wifiClient);
+
+  mqttClient.setServer(CONFIG_MQTT_HOST, CONFIG_MQTT_PORT);
+  if (! mqttClient.connect(CONFIG_MQTT_CLIENT_ID, CONFIG_MQTT_USERNAME, CONFIG_MQTT_PASSWORD))
     return;
 
-  char databuf[200];
-  if (g_syncOk && g_lastResultValid)
+  mqttClient.publish(CONFIG_MQTT_TOPIC "/status", "online");
+
+  char msgBuf[32];
+
+  const uint32 state = g_syncOk ? g_lastState : 255;
+  snprintf(msgBuf, sizeof(msgBuf), "%u", state);
+  mqttClient.publish(CONFIG_MQTT_TOPIC "/S1", msgBuf);
+
+  if (g_lastResultValid)
   {
-    // send state, temperature and pressure
-    sprintf(databuf, "#%s\n#S1#%d\n#T1#%d.%02u\n#P1#%d.%02u\n##\n",
-      CONFIG_NARODMON_DEVICE_ID, g_lastState,
-      g_lastTempValue/16, (g_lastTempValue & 0xF)*100/16,
-      g_lastPressValue/1000, (g_lastPressValue % 1000)/10
-    );
-  }
-  else
-  {
-    // send only state (255 if EBus is not available)
-    const uint32 state = g_syncOk ? g_lastState : 255;
-    sprintf(databuf, "#%s\n#S1#%d\n##\n",
-      CONFIG_NARODMON_DEVICE_ID, state
-    );
+    snprintf(msgBuf, sizeof(msgBuf), "%d.%02u", g_lastTempValue/16, (g_lastTempValue & 0xF)*100/16);
+    mqttClient.publish(CONFIG_MQTT_TOPIC "/T1", msgBuf);
+
+    snprintf(msgBuf, sizeof(msgBuf), "%d.%02u", g_lastPressValue/1000, (g_lastPressValue % 1000)/10);
+    mqttClient.publish(CONFIG_MQTT_TOPIC "/P1", msgBuf);
   }
 
-  const size_t sz = strlen(databuf);
-  sock.write((const uint8 *)databuf, sz);
+  mqttClient.disconnect();
 
   g_lastResultSent = true;
-  g_lastNarodMonTime = t;
 
-#endif // CONFIG_NARODMON_ENABLE
+#endif // CONFIG_MQTT_ENABLE
 }
 
 /////////////////////////////////////////////////////////////
@@ -1204,7 +1207,7 @@ void loop()
 {
   ProcessMonitor();
   ProcessIndication();
-  ProcessNarodmon();
+  ProcessMqttSend();
   ProcessWebServer();
   delay(10);
 }
