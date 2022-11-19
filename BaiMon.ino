@@ -19,7 +19,7 @@ extern "C" {
 /////////////////////////////////////////////////////////////
 // Defines
 
-#define BAIMON_VERSION "1.4"
+#define BAIMON_VERSION "1.5"
 
 #define EBUS_SLAVE_ADDR(MASTER) ((MASTER)+5)
 
@@ -649,14 +649,13 @@ EBusCommand g_monGetState;
 EBusCommand g_monGetTemp;
 EBusCommand g_monGetPress;
 
-// MQTT data upload
+// Server (narodmon.ru) data upload
 uint32 g_lastResultValid = false;
 uint32 g_lastResultSent = false;
+uint32 g_lastServerSendTime = 0;
 uint32 g_lastState = 0;
 uint32 g_lastTempValue = 0;
 uint32 g_lastPressValue = 0;
-
-uint32 g_lastMqttSendTime = 0;
 
 void SetupMonitor()
 {
@@ -1126,46 +1125,27 @@ void ProcessWebServer()
 }
 
 /////////////////////////////////////////////////////////////
-// Sending data to MQTT server
+// Sending data to narodmon.ru server
 
 enum
 {
-  MqttSendMinDelay = CONFIG_MQTT_START_DELAY*1000,   // Delay before first send after startup
-  MqttSendInterval = CONFIG_MQTT_SEND_INTERVAL*1000  // Regular data sending interval
+  ServerSendMinDelay = CONFIG_SERVER_START_DELAY*1000,   // Delay before first send after startup
+  ServerSendInterval = CONFIG_SERVER_SEND_INTERVAL*1000  // Regular data sending interval
 };
 
+#if CONFIG_SERVER_USE_MQTT
 
-void ProcessMqttSend()
+bool ServerUploadMqtt()
 {
-#if CONFIG_MQTT_ENABLE
-
-  if (g_syncOk && g_lastResultSent)
-    return;
-
-  uint32 t = millis();
-
-  // first time interval
-  if (g_lastMqttSendTime == 0)
-  {
-    if (t < MqttSendMinDelay)
-      return;
-  }
-  else
-  {
-    if ((t - g_lastMqttSendTime) < MqttSendInterval)
-      return;
-  }
-
-  g_lastMqttSendTime = t;
-
   WiFiClient wifiClient;
   PubSubClient mqttClient(wifiClient);
 
   mqttClient.setServer(CONFIG_MQTT_HOST, CONFIG_MQTT_PORT);
   if (! mqttClient.connect(CONFIG_MQTT_CLIENT_ID, CONFIG_MQTT_USERNAME, CONFIG_MQTT_PASSWORD))
-    return;
+    return false;
 
-  mqttClient.publish(CONFIG_MQTT_TOPIC "/status", "online");
+  // seems not needed
+  //mqttClient.publish(CONFIG_MQTT_TOPIC "/status", "online");
 
   char msgBuf[32];
 
@@ -1183,10 +1163,85 @@ void ProcessMqttSend()
   }
 
   mqttClient.disconnect();
+  return true;
+}
 
-  g_lastResultSent = true;
+#else
 
-#endif // CONFIG_MQTT_ENABLE
+bool ServerUploadTcp()
+{
+  char msgBuf[200];
+  char *p = msgBuf;
+
+  WiFiClient sock;
+  if (!sock.connect(CONFIG_TCP_HOST, CONFIG_TCP_PORT))
+    return false;
+
+  const uint32 state = g_syncOk ? g_lastState : 255;
+  snprintf(p, msgBuf + sizeof(msgBuf) - p, "#%s\n#S1#%u\n", CONFIG_SERVER_DEVICE_ID, state);
+  p += strlen(p);
+
+  if (g_lastResultValid)
+  {
+    snprintf(p, msgBuf + sizeof(msgBuf) - p, "#T1#%d.%02u\n#P1#%d.%02u\n", 
+      g_lastTempValue/16, (g_lastTempValue & 0xF)*100/16,
+      g_lastPressValue/1000, (g_lastPressValue % 1000)/10);
+    p += strlen(p);
+  }
+
+  sprintf(p,"##");
+  p += strlen(p);
+
+  const size_t sz = p - msgBuf;
+  sock.write((const uint8_t *)msgBuf, sz);
+
+  // wait for server reply
+  unsigned long t0 = millis();
+  while(sock.available() == 0)
+  {
+    if ((millis() - t0) > CONFIG_TCP_REPLY_TIMEOUT)
+      break;
+    delay(10);
+  }
+
+  sock.stop();
+  return true;
+}
+#endif
+
+void ProcessServerSend()
+{
+#if CONFIG_SERVER_UPLOAD_ENABLE
+
+  if (g_syncOk && g_lastResultSent)
+    return;
+
+  uint32 t = millis();
+
+  // first time interval
+  if (g_lastServerSendTime == 0)
+  {
+    if (t < ServerSendMinDelay)
+      return;
+  }
+  else
+  {
+    if ((t - g_lastServerSendTime) < ServerSendInterval)
+      return;
+  }
+
+  g_lastServerSendTime = t;
+
+#if CONFIG_SERVER_USE_MQTT
+  bool ok = ServerUploadMqtt();
+#else
+  bool ok = ServerUploadTcp();
+#endif
+
+  if (ok)
+    g_lastResultSent = true;
+
+#endif // CONFIG_SERVER_UPLOAD_ENABLE
 }
 
 /////////////////////////////////////////////////////////////
@@ -1207,7 +1262,7 @@ void loop()
 {
   ProcessMonitor();
   ProcessIndication();
-  ProcessMqttSend();
+  ProcessServerSend();
   ProcessWebServer();
   delay(10);
 }
